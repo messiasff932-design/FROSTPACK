@@ -64,13 +64,17 @@ async def run_db(func, *args, **kwargs):
 @app_commands.describe(cargo="Cargo que terá acesso de dono no bot")
 @app_commands.default_permissions(administrator=True)
 async def configurar_cargo_dono(interaction: discord.Interaction, cargo: discord.Role):
+    # Avisa o Discord para esperar o banco de dados responder
+    await interaction.response.defer(ephemeral=True)
+
     db = await run_db(load_db)
     db["discordSettings"]["cargoDonoId"] = str(cargo.id)
     await run_db(save_db, db)
-    await interaction.response.send_message(
-        f"✅ Cargo de dono do bot definido como {cargo.mention}.", ephemeral=True
+    
+    # Envia a mensagem de sucesso usando o followup
+    await interaction.followup.send(
+        f"✅ Cargo de dono do bot definido como {cargo.mention}."
     )
-
 
 @bot.tree.command(
     name="cadastrar-chaves",
