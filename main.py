@@ -70,11 +70,12 @@ async def configurar_cargo_dono(interaction: discord.Interaction, cargo: discord
     db = await run_db(load_db)
     db["discordSettings"]["cargoDonoId"] = str(cargo.id)
     await run_db(save_db, db)
-    
+
     # Envia a mensagem de sucesso usando o followup
     await interaction.followup.send(
         f"✅ Cargo de dono do bot definido como {cargo.mention}."
     )
+
 
 @bot.tree.command(
     name="cadastrar-chaves",
@@ -119,9 +120,13 @@ async def gerar_chaves_cmd(
     description="Abre o painel de administração do bot (só para o cargo de dono).",
 )
 async def painel_dono(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
     db = await run_db(load_db)
     if not is_dono(interaction.user, db):
-        return await acesso_negado(interaction)
+        return await interaction.followup.send(
+            "🚫 Você não tem o cargo de dono para usar isso.", ephemeral=True
+        )
 
     disponiveis = contar_chaves_disponiveis(db)
 
@@ -144,7 +149,7 @@ async def painel_dono(interaction: discord.Interaction):
         )
     )
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         content=f"**Painel do dono**\nChaves disponíveis para venda: **{disponiveis}**",
         view=view,
         ephemeral=True,
@@ -558,6 +563,25 @@ async def on_interaction(interaction: discord.Interaction):
                 await interaction.response.send_message(msg, ephemeral=True)
         except Exception:
             pass
+
+
+# ---------------- tratador de erro geral pra comandos de barra ----------------
+# Sem isso, se um comando (/painel-dono, /gerar-chaves, etc.) der qualquer
+# erro inesperado antes de responder, o Discord só mostra "O aplicativo não
+# respondeu" e não aparece nada no console. Com isso aqui, o erro some do
+# silêncio: aparece no log do bot E o usuário recebe uma mensagem.
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    print("Erro num comando de barra:", repr(error))
+    msg = "⚠️ Deu um erro nesse comando, olha o console do bot."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
 
 
 # ---------------- inicialização ----------------
