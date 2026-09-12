@@ -41,11 +41,13 @@ def load_db() -> dict:
     )
     data = resp.data if resp else None
     if not data or not data.get("value"):
-        raise RuntimeError(
-            "O banco de dados ainda não existe (nenhuma linha encontrada). "
-            "Abra o site do FROST SENSI pelo menos uma vez antes de rodar o bot, "
-            "para o banco ser criado."
-        )
+        # Antes isso lançava um erro e travava qualquer comando do bot em
+        # silêncio (Discord só mostrava "O aplicativo não respondeu", sem
+        # nenhuma mensagem de erro). Agora, se a linha ainda não existe
+        # (ex: site nunca foi aberto), o bot já cria ela sozinho.
+        db_novo = _com_defaults_do_bot({})
+        save_db(db_novo)
+        return db_novo
     return _com_defaults_do_bot(data["value"])
 
 
