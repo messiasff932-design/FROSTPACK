@@ -11,12 +11,12 @@ from dotenv import load_dotenv
 from db import (
     adicionar_chaves,
     contar_chaves_disponiveis,
-    definir_pix_ativa,
+    excluir_chave,
     gerar_chaves,
     load_db,
     marcar_chave_entregue,
     pegar_chave_disponivel,
-    remover_chave_pix,
+    resetar_chave,
     save_db,
 )
 from pix import gerar_payload_pix, gerar_qrcode_bytes
@@ -66,11 +66,16 @@ async def run_db(func, *args, **kwargs):
 @app_commands.describe(cargo="Cargo que terá acesso de dono no bot")
 @app_commands.default_permissions(administrator=True)
 async def configurar_cargo_dono(interaction: discord.Interaction, cargo: discord.Role):
+    # Avisa o Discord para esperar o banco de dados responder
+    await interaction.response.defer(ephemeral=True)
+
     db = await run_db(load_db)
     db["discordSettings"]["cargoDonoId"] = str(cargo.id)
     await run_db(save_db, db)
-    await interaction.response.send_message(
-        f"✅ Cargo de dono do bot definido como {cargo.mention}.", ephemeral=True
+
+    # Envia a mensagem de sucesso usando o followup
+    await interaction.followup.send(
+        f"✅ Cargo de dono do bot definido como {cargo.mention}."
     )
 
 
@@ -113,13 +118,59 @@ async def gerar_chaves_cmd(
 
 
 @bot.tree.command(
+    name="gerenciar-chave",
+    description="Reseta (deixa disponível de novo) ou exclui uma chave específica pelo código.",
+)
+@app_commands.describe(
+    codigo="Código da chave (ex: ABCD-EFGH-...)",
+    acao="O que fazer com essa chave",
+)
+@app_commands.choices(
+    acao=[
+        app_commands.Choice(name="Resetar (deixa disponível de novo)", value="resetar"),
+        app_commands.Choice(name="Excluir (apaga a chave definitivamente)", value="excluir"),
+    ]
+)
+async def gerenciar_chave(
+    interaction: discord.Interaction, codigo: str, acao: app_commands.Choice[str]
+):
+    db = await run_db(load_db)
+    if not is_dono(interaction.user, db):
+        return await acesso_negado(interaction)
+
+    await interaction.response.defer(ephemeral=True)
+
+    code = codigo.strip().upper()
+    if code not in db["keys"]:
+        return await interaction.followup.send(f"⚠️ Chave `{code}` não encontrada.", ephemeral=True)
+
+    if acao.value == "resetar":
+        resetar_chave(db, code)
+        await run_db(save_db, db)
+        return await interaction.followup.send(
+            f"🔄 Chave `{code}` resetada — ela está disponível de novo pra ser entregue.",
+            ephemeral=True,
+        )
+    else:
+        excluir_chave(db, code)
+        await run_db(save_db, db)
+        return await interaction.followup.send(
+            f"🗑️ Chave `{code}` excluída definitivamente do banco.", ephemeral=True
+        )
+
+
+@bot.tree.command(
     name="painel-dono",
     description="Abre o painel de administração do bot (só para o cargo de dono).",
 )
 async def painel_dono(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
     db = await run_db(load_db)
     if not is_dono(interaction.user, db):
-        return await acesso_negado(interaction)
+        return await interaction.followup.send(
+            "🚫 Você não tem o cargo de dono para usar isso.", ephemeral=True
+        )
 
     disponiveis = contar_chaves_disponiveis(db)
 
@@ -141,8 +192,15 @@ async def painel_dono(interaction: discord.Interaction):
             style=discord.ButtonStyle.secondary,
         )
     )
+    view.add_item(
+        discord.ui.Button(
+            custom_id="pd_remover_pix",
+            label="Remover Pix",
+            style=discord.ButtonStyle.danger,
+        )
+    )
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         content=f"**Painel do dono**\nChaves disponíveis para venda: **{disponiveis}**",
         view=view,
         ephemeral=True,
@@ -160,12 +218,14 @@ class ModalCadastrarChaves(discord.ui.Modal, title="Cadastrar chaves"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
         db = await run_db(load_db)
         codigos = str(self.chaves_lista.value).split(",")
         adicionadas, repetidas = adicionar_chaves(db, codigos)
         await run_db(save_db, db)
         extra = f" ({repetidas} já existiam e foram ignoradas.)" if repetidas else ""
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ {adicionadas} chave(s) cadastrada(s).{extra}", ephemeral=True
         )
 
@@ -230,6 +290,8 @@ class ModalCadastrarPix(discord.ui.Modal, title="Cadastrar chave Pix"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
         db = await run_db(load_db)
         chave = str(self.pix_chave.value).strip()
         nome = str(self.pix_nome.value).strip()
@@ -242,7 +304,7 @@ class ModalCadastrarPix(discord.ui.Modal, title="Cadastrar chave Pix"):
         db["discordSettings"]["pixAtivaId"] = pix_id
         await run_db(save_db, db)
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ Chave Pix de **{nome}** cadastrada e definida como ativa.", ephemeral=True
         )
 
@@ -250,104 +312,81 @@ class ModalCadastrarPix(discord.ui.Modal, title="Cadastrar chave Pix"):
 # ---------------- botões do painel do dono ----------------
 
 async def on_botao_ver_pix(interaction: discord.Interaction):
-    db = await run_db(load_db)
-    if not is_dono(interaction.user, db):
-        return await acesso_negado(interaction)
+    await interaction.response.defer(ephemeral=True)
 
+    db = await run_db(load_db)
     lista = db["discordSettings"]["pixKeys"]
     if not lista:
-        return await interaction.response.send_message(
+        return await interaction.followup.send(
             "Nenhuma chave Pix cadastrada ainda.", ephemeral=True
         )
-
     ativa_id = db["discordSettings"]["pixAtivaId"]
     linhas = [
         f"{'✅ (ativa)' if p['id'] == ativa_id else '⬜'} **{p['nome']}** — `{p['chave']}` — {p['cidade']}"
         for p in lista
     ]
+    await interaction.followup.send("\n".join(linhas), ephemeral=True)
 
-    def opcoes():
-        return [
+
+async def on_botao_remover_pix(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    db = await run_db(load_db)
+    lista = db["discordSettings"]["pixKeys"]
+    if not lista:
+        return await interaction.followup.send(
+            "Nenhuma chave Pix cadastrada ainda.", ephemeral=True
+        )
+
+    ativa_id = db["discordSettings"]["pixAtivaId"]
+    options = []
+    for p in lista[:25]:  # o Discord só permite até 25 opções num select
+        marca = "✅ " if p["id"] == ativa_id else ""
+        options.append(
             discord.SelectOption(
-                label=p["nome"][:100],
-                description=f"{p['chave']} — {p['cidade']}"[:100],
+                label=f"{marca}{p['nome']} — {p['cidade']}"[:100],
+                description=p["chave"][:100],
                 value=p["id"],
-                default=(p["id"] == ativa_id),
             )
-            for p in lista[:25]
-        ]
+        )
 
+    select = discord.ui.Select(
+        custom_id="select_remover_pix",
+        placeholder="Escolha qual chave Pix remover",
+        options=options,
+    )
     view = discord.ui.View(timeout=None)
-    view.add_item(
-        discord.ui.Select(
-            custom_id="pix_definir_ativa",
-            placeholder="Definir chave Pix ativa",
-            options=opcoes(),
-        )
-    )
-    view.add_item(
-        discord.ui.Select(
-            custom_id="pix_excluir",
-            placeholder="🗑️ Excluir uma chave Pix",
-            options=opcoes(),
-        )
-    )
-
-    await interaction.response.send_message(
-        content="\n".join(linhas), view=view, ephemeral=True
+    view.add_item(select)
+    await interaction.followup.send(
+        content="Selecione a chave Pix que deseja remover:", view=view, ephemeral=True
     )
 
 
-async def on_select_pix_definir(interaction: discord.Interaction):
-    db = await run_db(load_db)
-    if not is_dono(interaction.user, db):
-        return await acesso_negado(interaction)
+async def on_select_remover_pix(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
 
     values = (interaction.data or {}).get("values", [])
     if not values:
-        return await interaction.response.send_message("⚠️ Nada selecionado.", ephemeral=True)
-
+        return await interaction.followup.send("⚠️ Nada selecionado.", ephemeral=True)
     pix_id = values[0]
-    if not definir_pix_ativa(db, pix_id):
-        return await interaction.response.send_message(
-            "⚠️ Essa chave não existe mais (atualize o painel).", ephemeral=True
-        )
-    await run_db(save_db, db)
 
-    pix = next(p for p in db["discordSettings"]["pixKeys"] if p["id"] == pix_id)
-    await interaction.response.edit_message(
-        content=f"✅ Chave Pix ativa agora é **{pix['nome']}** — `{pix['chave']}` — {pix['cidade']}.",
-        view=None,
-    )
-
-
-async def on_select_pix_excluir(interaction: discord.Interaction):
     db = await run_db(load_db)
-    if not is_dono(interaction.user, db):
-        return await acesso_negado(interaction)
+    lista = db["discordSettings"]["pixKeys"]
+    removida = next((p for p in lista if p["id"] == pix_id), None)
+    if not removida:
+        return await interaction.followup.send("⚠️ Essa chave já não existe mais.", ephemeral=True)
 
-    values = (interaction.data or {}).get("values", [])
-    if not values:
-        return await interaction.response.send_message("⚠️ Nada selecionado.", ephemeral=True)
+    db["discordSettings"]["pixKeys"] = [p for p in lista if p["id"] != pix_id]
 
-    pix_id = values[0]
-    pix = next((p for p in db["discordSettings"]["pixKeys"] if p["id"] == pix_id), None)
-    if not remover_chave_pix(db, pix_id):
-        return await interaction.response.send_message(
-            "⚠️ Essa chave já tinha sido removida (atualize o painel).", ephemeral=True
-        )
+    # Se a chave removida era a ativa, define outra como ativa (se sobrar
+    # alguma) ou deixa None (aí "Confirmar compra" avisa pra cadastrar uma nova).
+    if db["discordSettings"]["pixAtivaId"] == pix_id:
+        restantes = db["discordSettings"]["pixKeys"]
+        db["discordSettings"]["pixAtivaId"] = restantes[0]["id"] if restantes else None
+
     await run_db(save_db, db)
-
-    nome = pix["nome"] if pix else pix_id
-    nova_ativa_id = db["discordSettings"].get("pixAtivaId")
-    if nova_ativa_id:
-        nova = next(p for p in db["discordSettings"]["pixKeys"] if p["id"] == nova_ativa_id)
-        aviso = f"\nA chave ativa agora é **{nova['nome']}** — `{nova['chave']}`."
-    else:
-        aviso = "\n⚠️ Nenhuma chave Pix ativa restou — cadastre uma nova antes de vender."
-
-    await interaction.response.edit_message(
-        content=f"🗑️ Chave Pix de **{nome}** removida.{aviso}", view=None
+    await interaction.followup.send(
+        f"🗑️ Chave Pix de **{removida['nome']}** removida.", ephemeral=True
     )
 
 
@@ -387,6 +426,9 @@ async def on_select_canal_painel(interaction: discord.Interaction):
         )
     canal = interaction.guild.get_channel(int(values[0]))
 
+    # Responde já (edit_message conta como a resposta), antes de mexer no banco
+    await interaction.response.edit_message(content="Enviando painel...", view=None)
+
     db = await run_db(load_db)
     painel_id = "painel" + str(int(time.time() * 1000))
     db["discordSettings"]["paineis"][painel_id] = rascunho
@@ -401,16 +443,18 @@ async def on_select_canal_painel(interaction: discord.Interaction):
     await canal.send(embed=embed_painel(**rascunho), view=view)
 
     rascunhos_painel.pop(interaction.user.id, None)
-    await interaction.response.edit_message(content=f"✅ Painel enviado em {canal.mention}.", view=None)
+    await interaction.edit_original_response(content=f"✅ Painel enviado em {canal.mention}.")
 
 
 # ---------------- fluxo de compra ----------------
 
 async def on_botao_comprar(interaction: discord.Interaction, painel_id: str):
+    await interaction.response.defer(ephemeral=True)
+
     db = await run_db(load_db)
     painel = db["discordSettings"]["paineis"].get(painel_id)
     if not painel:
-        return await interaction.response.send_message(
+        return await interaction.followup.send(
             "⚠️ Esse painel não existe mais.", ephemeral=True
         )
 
@@ -426,7 +470,7 @@ async def on_botao_comprar(interaction: discord.Interaction, painel_id: str):
         )
     )
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         content=f"Você deseja comprar **{painel['titulo']}** por **{preco_str(painel['preco'])}**?",
         view=view,
         ephemeral=True,
@@ -529,22 +573,17 @@ async def on_botao_comprar_sim(interaction: discord.Interaction, painel_id: str)
 # ---------------- copiar pix / confirmar compra ----------------
 
 async def on_botao_copiar_pix(interaction: discord.Interaction, canal_id: str):
-    # Responde (defer) ANTES de consultar o banco, pra não estourar os 3s
-    # que o Discord dá pra responder uma interação.
     await interaction.response.defer(ephemeral=True)
 
     db = await run_db(load_db)
     venda = db["discordSettings"]["vendasPendentes"].get(canal_id)
     if not venda:
-        return await interaction.followup.send("⚠️ Essa cobrança não existe mais.", ephemeral=True)
-
-    ativa_id = db["discordSettings"].get("pixAtivaId")
-    pix = next((p for p in db["discordSettings"]["pixKeys"] if p["id"] == ativa_id), None)
-    if not pix:
         return await interaction.followup.send(
-            "⚠️ Nenhuma chave Pix ativa cadastrada no momento. Avise o dono.", ephemeral=True
+            "⚠️ Essa cobrança não existe mais.", ephemeral=True
         )
-
+    pix = next(
+        p for p in db["discordSettings"]["pixKeys"] if p["id"] == db["discordSettings"]["pixAtivaId"]
+    )
     payload = gerar_payload_pix(
         chave=pix["chave"],
         nome=pix["nome"],
@@ -556,9 +595,6 @@ async def on_botao_copiar_pix(interaction: discord.Interaction, canal_id: str):
 
 
 async def on_botao_confirmar_compra(interaction: discord.Interaction, canal_id: str):
-    # Responde (defer) ANTES de qualquer chamada ao banco. Era isso que
-    # estourava os 3s do Discord e fazia o botão "falhar": o bot ficava
-    # esperando o Supabase responder antes de sequer reconhecer o clique.
     await interaction.response.defer()
 
     db = await run_db(load_db)
@@ -569,7 +605,9 @@ async def on_botao_confirmar_compra(interaction: discord.Interaction, canal_id: 
 
     venda = db["discordSettings"]["vendasPendentes"].get(canal_id)
     if not venda:
-        return await interaction.followup.send("⚠️ Essa cobrança não existe mais.", ephemeral=True)
+        return await interaction.followup.send(
+            "⚠️ Essa cobrança não existe mais.", ephemeral=True
+        )
 
     chave = pegar_chave_disponivel(db)
     if not chave:
@@ -582,7 +620,6 @@ async def on_botao_confirmar_compra(interaction: discord.Interaction, canal_id: 
     await run_db(save_db, db)
 
     comprador = await bot.fetch_user(int(venda["buyerId"]))
-    dm_falhou = False
     try:
         await comprador.send(
             "✅ Pagamento confirmado! Aqui está sua chave de acesso do **FROST SENSI**:\n"
@@ -590,23 +627,13 @@ async def on_botao_confirmar_compra(interaction: discord.Interaction, canal_id: 
             'Use essa chave em "Criar conta" no site para liberar seu acesso.'
         )
     except discord.Forbidden:
-        dm_falhou = True
-
-    # Agora a chave é sempre mandada no canal também (além da DM), não só
-    # quando a DM falha — assim ela fica registrada mesmo que o cliente
-    # não veja a DM a tempo do canal ser apagado.
-    aviso_dm = (
-        "⚠️ Não consegui te chamar no privado (DM fechada) — a chave está aqui embaixo."
-        if dm_falhou
-        else "Também te chamei no privado com a mesma chave."
-    )
-    await interaction.channel.send(
-        f"✅ Pagamento confirmado! {aviso_dm}\n"
-        f"Chave de acesso do **FROST SENSI**:\n```{chave['code']}```"
-    )
+        await interaction.channel.send(
+            "⚠️ Não consegui enviar a chave no privado do comprador (DM fechada). "
+            f"Envie manualmente: `{chave['code']}`"
+        )
 
     await interaction.followup.send(
-        "✅ Compra confirmada. Este canal será apagado em 10 segundos."
+        "✅ Compra confirmada, chave enviada no privado do cliente. Este canal será apagado em 10 segundos."
     )
 
     canal = interaction.channel
@@ -640,6 +667,8 @@ async def on_interaction(interaction: discord.Interaction):
                 return await interaction.response.send_modal(ModalCadastrarPix())
             if custom_id == "pd_ver_pix":
                 return await on_botao_ver_pix(interaction)
+            if custom_id == "pd_remover_pix":
+                return await on_botao_remover_pix(interaction)
             if custom_id == "pd_enviar_painel":
                 return await on_botao_enviar_painel(interaction)
             if custom_id.startswith("buy_"):
@@ -653,11 +682,8 @@ async def on_interaction(interaction: discord.Interaction):
             if custom_id.startswith("confirmar_"):
                 return await on_botao_confirmar_compra(interaction, custom_id[len("confirmar_"):])
 
-        elif component_type == 3:  # select menu (string select)
-            if custom_id == "pix_definir_ativa":
-                return await on_select_pix_definir(interaction)
-            if custom_id == "pix_excluir":
-                return await on_select_pix_excluir(interaction)
+        elif component_type == 3 and custom_id == "select_remover_pix":  # string select
+            return await on_select_remover_pix(interaction)
 
         elif component_type == 8 and custom_id == "select_canal_painel":  # channel select
             return await on_select_canal_painel(interaction)
@@ -672,6 +698,25 @@ async def on_interaction(interaction: discord.Interaction):
                 await interaction.response.send_message(msg, ephemeral=True)
         except Exception:
             pass
+
+
+# ---------------- tratador de erro geral pra comandos de barra ----------------
+# Sem isso, se um comando (/painel-dono, /gerar-chaves, etc.) der qualquer
+# erro inesperado antes de responder, o Discord só mostra "O aplicativo não
+# respondeu" e não aparece nada no console. Com isso aqui, o erro some do
+# silêncio: aparece no log do bot E o usuário recebe uma mensagem.
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    print("Erro num comando de barra:", repr(error))
+    msg = "⚠️ Deu um erro nesse comando, olha o console do bot."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
 
 
 # ---------------- inicialização ----------------
