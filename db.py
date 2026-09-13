@@ -41,11 +41,13 @@ def load_db() -> dict:
     )
     data = resp.data if resp else None
     if not data or not data.get("value"):
-        raise RuntimeError(
-            "O banco de dados ainda não existe (nenhuma linha encontrada). "
-            "Abra o site do FROST SENSI pelo menos uma vez antes de rodar o bot, "
-            "para o banco ser criado."
-        )
+        # Antes isso lançava um erro e travava qualquer comando do bot em
+        # silêncio (Discord só mostrava "O aplicativo não respondeu", sem
+        # nenhuma mensagem de erro). Agora, se a linha ainda não existe
+        # (ex: site nunca foi aberto), o bot já cria ela sozinho.
+        db_novo = _com_defaults_do_bot({})
+        save_db(db_novo)
+        return db_novo
     return _com_defaults_do_bot(data["value"])
 
 
@@ -130,27 +132,21 @@ def contar_chaves_disponiveis(db: dict) -> int:
     )
 
 
-# ---------------- Pix ----------------
-
-def remover_chave_pix(db: dict, pix_id: str) -> bool:
-    """Remove uma chave Pix cadastrada. Se ela era a chave ativa, a chave
-    ativa passa a ser outra que tenha sobrado (ou nenhuma, se não sobrar
-    mais nenhuma) — assim nunca fica uma chave ativa "fantasma" apontando
-    pra um Pix que não existe mais."""
-    lista = db["discordSettings"]["pixKeys"]
-    nova_lista = [p for p in lista if p["id"] != pix_id]
-    removeu = len(nova_lista) < len(lista)
-    db["discordSettings"]["pixKeys"] = nova_lista
-
-    if removeu and db["discordSettings"].get("pixAtivaId") == pix_id:
-        db["discordSettings"]["pixAtivaId"] = nova_lista[0]["id"] if nova_lista else None
-
-    return removeu
+def resetar_chave(db: dict, code: str) -> bool:
+    """Deixa uma chave disponível de novo: limpa status, dono e a marca de
+    'entregue pelo Discord', sem apagar ela do banco. Use isso quando uma
+    venda foi cancelada/estornada mas a chave já tinha sido entregue."""
+    k = db["keys"].get(code)
+    if not k:
+        return False
+    k["status"] = "disponivel"
+    k["online"] = False
+    k["ownerUsername"] = None
+    k.pop("entregueDiscord", None)
+    return True
 
 
-def definir_pix_ativa(db: dict, pix_id: str) -> bool:
-    """Define qual chave Pix cadastrada é a usada nas cobranças novas."""
-    if any(p["id"] == pix_id for p in db["discordSettings"]["pixKeys"]):
-        db["discordSettings"]["pixAtivaId"] = pix_id
-        return True
-    return False
+def excluir_chave(db: dict, code: str) -> bool:
+    """Apaga a chave definitivamente do banco (ex: chave vazou e não deve
+    mais poder ser usada nem resetada)."""
+    return db["keys"].pop(code, None) is not None
