@@ -41,13 +41,11 @@ def load_db() -> dict:
     )
     data = resp.data if resp else None
     if not data or not data.get("value"):
-        # Antes isso lançava um erro e travava qualquer comando do bot em
-        # silêncio (Discord só mostrava "O aplicativo não respondeu", sem
-        # nenhuma mensagem de erro). Agora, se a linha ainda não existe
-        # (ex: site nunca foi aberto), o bot já cria ela sozinho.
-        db_novo = _com_defaults_do_bot({})
-        save_db(db_novo)
-        return db_novo
+        raise RuntimeError(
+            "O banco de dados ainda não existe (nenhuma linha encontrada). "
+            "Abra o site do FROST SENSI pelo menos uma vez antes de rodar o bot, "
+            "para o banco ser criado."
+        )
     return _com_defaults_do_bot(data["value"])
 
 
@@ -132,21 +130,34 @@ def contar_chaves_disponiveis(db: dict) -> int:
     )
 
 
-def resetar_chave(db: dict, code: str) -> bool:
-    """Deixa uma chave disponível de novo: limpa status, dono e a marca de
-    'entregue pelo Discord', sem apagar ela do banco. Use isso quando uma
-    venda foi cancelada/estornada mas a chave já tinha sido entregue."""
-    k = db["keys"].get(code)
-    if not k:
-        return False
-    k["status"] = "disponivel"
-    k["online"] = False
-    k["ownerUsername"] = None
-    k.pop("entregueDiscord", None)
-    return True
+def chaves_revogadas(db: dict) -> list:
+    """Lista todas as chaves com status 'revogada', mais recentes primeiro."""
+    return sorted(
+        (k for k in db["keys"].values() if k.get("status") == "revogada"),
+        key=lambda k: k.get("criadaEm", 0),
+        reverse=True,
+    )
 
 
 def excluir_chave(db: dict, code: str) -> bool:
-    """Apaga a chave definitivamente do banco (ex: chave vazou e não deve
-    mais poder ser usada nem resetada)."""
-    return db["keys"].pop(code, None) is not None
+    """Remove uma chave do banco definitivamente. Só chame isso depois de
+    confirmar a senha do dono E uma confirmação explícita — não tem volta."""
+    code = (code or "").strip().upper()
+    if code in db["keys"]:
+        del db["keys"][code]
+        return True
+    return False
+
+
+def senha_de_dono_confere(db: dict, senha: str) -> bool:
+    """Confere se a senha bate com o dono principal (adminCreds) ou com
+    algum dono extra (owners). Usado como segunda confirmação antes de
+    ações destrutivas (excluir chave), além da checagem de cargo."""
+    if not senha:
+        return False
+    if senha == (db.get("adminCreds") or {}).get("pass"):
+        return True
+    for o in db.get("owners") or []:
+        if senha == o.get("pass"):
+            return True
+    return False
